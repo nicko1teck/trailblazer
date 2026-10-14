@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Secrets and local configuration - never commit these
+.env
+.env.*
+!.env.example
+ecosystem.config.js
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Archives
+*.zip
