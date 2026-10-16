@@ -1,0 +1,97 @@
+# Deploys TrailBlazer to EC2 whenever master is pushed.
+# Can also be started by hand from the repo's Actions tab ("Run workflow").
+#
+# Required repository SECRETS (Settings > Secrets and variables > Actions > Secrets):
+#   EC2_HOST     the server's Elastic IP
+#   EC2_USER     the login user on the server (ec2-user)
+#   EC2_SSH_KEY  the PRIVATE half of the dedicated deploy key
+#
+# The app's settings (database, keys) are NOT here. They live in
+# /home/ec2-user/trailblazer.env on the server.
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-trailblazer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Package the release
+        run: |
+          tar czf /tmp/release.tgz --exclude=.git --exclude=.github --exclude=node_modules .
+
+      - name: Set up SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload the release
+        run: |
+          scp -i ~/.ssh/deploy_key /tmp/release.tgz \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/trailblazer-release.tgz"
+
+      # The server's Node comes from nvm, so log in with a login shell (bash -l).
+      - name: Install the release, restart, and check it is healthy
+        run: |
+          RELEASE="$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" bash -l -s "$RELEASE" <<'REMOTE'
+          set -euo pipefail
+          REL="$1"
+          BASE="$HOME/trailblazer"
+
+          mkdir -p "$BASE/releases/$REL"
+          tar xzf /tmp/trailblazer-release.tgz -C "$BASE/releases/$REL"
+          rm -f /tmp/trailblazer-release.tgz
+
+          echo "Installing packages"
+          (cd "$BASE/releases/$REL" && npm ci --omit=dev)
+
+          # Remember what is live now, then switch to the new release.
+          # (Only a link that really leads somewhere counts. The very first deploy has none.)
+          PREV=""
+          if [ -e "$BASE/current" ]; then PREV="$(readlink -f "$BASE/current")"; fi
+          ln -sfn "$BASE/releases/$REL" "$BASE/current"
+          sudo systemctl restart trailblazer
+
+          healthy() {
+            for i in $(seq 1 20); do
+              if curl -fs -o /dev/null http://localhost:3001/; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          if healthy; then
+            echo "Healthy: TrailBlazer answers on port 3001"
+            # Keep the 5 newest releases.
+            (cd "$BASE/releases" && ls -1dt */ | tail -n +6 | xargs -r rm -rf) || true
+          else
+            echo "Health check FAILED"
+            sudo journalctl -u trailblazer -n 25 --no-pager | sed -E 's/(mongodb(\+srv)?:\/\/)[^ ]*/\1***/g' || true
+            if [ -n "$PREV" ] && [ -d "$PREV" ]; then
+              ln -sfn "$PREV" "$BASE/current"
+              sudo systemctl restart trailblazer
+              echo "Rolled back to $PREV"
+            else
+              echo "No previous release to roll back to"
+            fi
+            exit 1
+          fi
+          REMOTE
