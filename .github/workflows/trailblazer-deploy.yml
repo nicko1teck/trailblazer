@@ -1,13 +1,17 @@
-# Deploys TrailBlazer to EC2 whenever master is pushed.
+# Deploys TrailBlazer to EC2 (Server B) whenever master is pushed.
 # Can also be started by hand from the repo's Actions tab ("Run workflow").
 #
-# Required repository SECRETS (Settings > Secrets and variables > Actions > Secrets):
-#   EC2_HOST     the server's Elastic IP
-#   EC2_USER     the login user on the server (ec2-user)
-#   EC2_SSH_KEY  the PRIVATE half of the dedicated deploy key
+# No keys or passwords are stored for this. GitHub gives each run a short-lived
+# OIDC token; AWS swaps it for a temporary role (github-deploy-trailblazer) that may only
+# upload to the deploy bucket and run commands on Server B.
+#
+# Required repository VARIABLES (Settings > Secrets and variables > Actions > Variables):
+#   AWS_DEPLOY_ROLE_ARN   ARN of the github-deploy-trailblazer role
+#   EC2_INSTANCE_ID       Server B's instance ID
 #
 # The app's settings (database, keys) are NOT here. They live in
 # /home/ec2-user/trailblazer.env on the server.
+# Server B runs 8:30 AM to 6 PM Central on weekdays; a deploy outside those hours will time out.
 name: Deploy to EC2
 
 on:
@@ -20,7 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  id-token: write   # lets the run request its OIDC token
+  contents: read    # lets actions/checkout read the code
+
+env:
+  AWS_REGION: us-east-1
+  BUCKET: nickowen-deploy-artifacts
 
 jobs:
   deploy:
@@ -32,66 +41,59 @@ jobs:
       - name: Package the release
         run: |
           tar czf /tmp/release.tgz --exclude=.git --exclude=.github --exclude=node_modules .
+          mv /tmp/release.tgz release.tgz
 
-      - name: Set up SSH
+      # Swap GitHub's OIDC token for temporary AWS credentials (pinned to a commit, as GitHub's docs show).
+      - name: Get temporary AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Each commit gets its own folder, so nothing is ever overwritten.
+      - name: Upload the release and install script to S3
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+          PREFIX="trailblazer/$GITHUB_SHA"
+          aws s3 cp release.tgz       "s3://$BUCKET/$PREFIX/release.tgz" --only-show-errors
+          aws s3 cp deploy/install.sh "s3://$BUCKET/$PREFIX/install.sh"  --only-show-errors
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
 
-      - name: Upload the release
-        run: |
-          scp -i ~/.ssh/deploy_key /tmp/release.tgz \
-            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/trailblazer-release.tgz"
-
-      # The server's Node comes from nvm, so log in with a login shell (bash -l).
-      - name: Install the release, restart, and check it is healthy
+      # Run Command runs as root; the install runs as ec2-user in a login shell (nvm's Node, the app folders).
+      - name: Tell Server B to install it (SSM Run Command)
         run: |
           RELEASE="$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
-          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" bash -l -s "$RELEASE" <<'REMOTE'
-          set -euo pipefail
-          REL="$1"
-          BASE="$HOME/trailblazer"
+          PARAMS=$(jq -n \
+            --arg get "aws s3 cp s3://$BUCKET/$PREFIX/install.sh /tmp/trailblazer-install.sh --only-show-errors && chmod 755 /tmp/trailblazer-install.sh" \
+            --arg run "sudo -iu ec2-user bash -l /tmp/trailblazer-install.sh $BUCKET $PREFIX/release.tgz $RELEASE" \
+            '{commands: [$get, $run]}')
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy trailblazer ${GITHUB_SHA::7}" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query Command.CommandId --output text)
+          echo "Command ID: $CMD_ID"
+          echo "CMD_ID=$CMD_ID" >> "$GITHUB_ENV"
 
-          mkdir -p "$BASE/releases/$REL"
-          tar xzf /tmp/trailblazer-release.tgz -C "$BASE/releases/$REL"
-          rm -f /tmp/trailblazer-release.tgz
-
-          echo "Installing packages"
-          (cd "$BASE/releases/$REL" && npm ci --omit=dev)
-
-          # Remember what is live now, then switch to the new release.
-          # (Only a link that really leads somewhere counts. The very first deploy has none.)
-          PREV=""
-          if [ -e "$BASE/current" ]; then PREV="$(readlink -f "$BASE/current")"; fi
-          ln -sfn "$BASE/releases/$REL" "$BASE/current"
-          sudo systemctl restart trailblazer
-
-          healthy() {
-            for i in $(seq 1 20); do
-              if curl -fs -o /dev/null http://localhost:3001/; then
-                return 0
-              fi
-              sleep 3
-            done
-            return 1
-          }
-
-          if healthy; then
-            echo "Healthy: TrailBlazer answers on port 3001"
-            # Keep the 5 newest releases.
-            (cd "$BASE/releases" && ls -1dt */ | tail -n +6 | xargs -r rm -rf) || true
-          else
-            echo "Health check FAILED"
-            sudo journalctl -u trailblazer -n 25 --no-pager | sed -E 's/(mongodb(\+srv)?:\/\/)[^ ]*/\1***/g' || true
-            if [ -n "$PREV" ] && [ -d "$PREV" ]; then
-              ln -sfn "$PREV" "$BASE/current"
-              sudo systemctl restart trailblazer
-              echo "Rolled back to $PREV"
-            else
-              echo "No previous release to roll back to"
-            fi
-            exit 1
-          fi
-          REMOTE
+      - name: Wait for the result
+        run: |
+          STATUS="Pending"
+          for i in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Pending|InProgress|Delayed) continue ;; *) break ;; esac
+          done
+          echo "Status: $STATUS"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text || true
+          case "$STATUS" in
+            Success) echo "Deploy succeeded." ;;
+            Failed)  echo "::error::The install script failed on Server B. See its output above."; exit 1 ;;
+            Pending|InProgress|Delayed|Undeliverable|TimedOut|DeliveryTimedOut)
+                     echo "::error::Server B never ran the command (status: $STATUS). Is it running? It's scheduled 8:30 AM to 6 PM Central, weekdays."; exit 1 ;;
+            *)       echo "::error::Deploy did not succeed (status: $STATUS)."; exit 1 ;;
+          esac
